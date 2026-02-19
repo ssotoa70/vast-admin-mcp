@@ -362,11 +362,11 @@ For issues or questions:
 
 ## License
 
-[Your License Here]
+[MIT]
 
 ## Author
 
-[Your Name/Organization]
+[Sergio Soto/VAST Data]
 
 ## Last Updated
 
