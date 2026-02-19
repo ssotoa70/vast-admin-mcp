@@ -20,7 +20,7 @@ import argparse
 import logging
 import pathlib
 import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 # Constants
 INSTALL_DIR = pathlib.Path.home() / ".claude" / "mcp" / "vast-admin"
@@ -142,9 +142,117 @@ def print_section(title: str) -> None:
     print(f"\n--- {title} ---")
 
 
+def _detect_linux_distro() -> str:
+    """
+    Detect Linux distribution from /etc/os-release.
+
+    Returns:
+        String like "AlmaLinux 9.2" or "Rocky 8.5"
+
+    Raises:
+        SystemExit: If /etc/os-release does not exist
+    """
+    os_release_path = pathlib.Path("/etc/os-release")
+
+    if not os_release_path.exists():
+        log_error(f"/etc/os-release not found. Cannot detect Linux distribution.", fatal=True)
+
+    # Parse /etc/os-release
+    os_info = {}
+    try:
+        with open(os_release_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    # Remove quotes if present
+                    value = value.strip('"').strip("'")
+                    os_info[key] = value
+    except Exception as e:
+        log_error(f"Failed to read /etc/os-release: {e}", fatal=True)
+
+    # Extract NAME and VERSION_ID
+    name = os_info.get("NAME", "Unknown")
+    version = os_info.get("VERSION_ID", "Unknown")
+    pretty_name = os_info.get("PRETTY_NAME", "")
+
+    # Check for supported distributions
+    supported_distros = ["AlmaLinux", "Rocky", "CentOS", "RHEL", "Fedora"]
+    is_supported = any(distro in pretty_name for distro in supported_distros)
+
+    if not is_supported:
+        log_warn(
+            f"Detected unsupported Linux distribution: {pretty_name}. "
+            f"Only AlmaLinux, Rocky, CentOS, RHEL, and Fedora are officially supported."
+        )
+
+    return f"{name} {version}"
+
+
+def detect_os() -> Tuple[str, str]:
+    """
+    Detect the operating system and version.
+
+    For macOS: Returns ("macos", "X.X") where X.X is the major version
+    For Linux: Returns ("linux", "DistroName version")
+
+    Returns:
+        Tuple of (os_type, version)
+
+    Raises:
+        SystemExit: If OS is neither macOS nor Linux, or on error
+    """
+    system = platform.system()
+
+    if system == "Darwin":
+        # macOS detection
+        mac_version = platform.mac_ver()[0]
+        if not mac_version:
+            log_error("Failed to detect macOS version.", fatal=True)
+
+        # Extract major version number
+        try:
+            major_version = int(mac_version.split(".")[0])
+        except (IndexError, ValueError):
+            log_error(f"Invalid macOS version format: {mac_version}", fatal=True)
+
+        # Check if macOS version >= 14
+        if major_version < 14:
+            log_warn(
+                f"macOS {mac_version} is earlier than macOS 14. "
+                f"This installer is tested on macOS 14 and later."
+            )
+            response = input("Continue anyway? (Y/N): ").strip().upper()
+            if response != "Y":
+                log_error("Installation cancelled by user.", fatal=True)
+
+        INSTALL_STATE["os"] = "macos"
+        INSTALL_STATE["os_version"] = mac_version
+        log_info(f"Detected: macOS {mac_version}")
+        return ("macos", mac_version)
+
+    elif system == "Linux":
+        # Linux detection
+        linux_distro = _detect_linux_distro()
+        INSTALL_STATE["os"] = "linux"
+        INSTALL_STATE["os_version"] = linux_distro
+        log_info(f"Detected: {linux_distro}")
+        return ("linux", linux_distro)
+
+    else:
+        log_error(
+            f"Unsupported operating system: {system}. "
+            f"This installer supports macOS 14+ and RHEL-based Linux distributions.",
+            fatal=True
+        )
+
+
 def run_installation() -> None:
     """Run the installation process."""
-    pass
+    print_header("VAST Admin MCP Installer")
+
+    # Detect OS
+    os_type, os_version = detect_os()
 
 
 def run_revert() -> None:
