@@ -593,6 +593,8 @@ def get_http_server_status(config: dict) -> str:
     ssl_config = http_config.get('ssl', {})
     if ssl_config.get('enabled', False):
         parts.append("SSL: enabled")
+    if http_config.get('disable_output_auth', False):
+        parts.append("graph links: unauthenticated")
     
     return "Enabled (" + ", ".join(parts) + ")"
 
@@ -634,6 +636,10 @@ def _configure_http_server(config: dict) -> dict:
     http_config['host'] = host
     http_config['port'] = port
     http_config['path'] = path
+    http_config['disable_output_auth'] = query_yes_no(
+        "Disable authentication for generated graph PNG links?",
+        default="yes" if http_config.get('disable_output_auth', False) else "no"
+    )
     
     # Authentication configuration
     print("\nAuthentication:")

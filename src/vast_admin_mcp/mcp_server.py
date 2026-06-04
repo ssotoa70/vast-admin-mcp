@@ -5,6 +5,7 @@ import logging
 import os
 import types
 from typing import Optional, List, Dict, Any
+from urllib.parse import quote
 
 from fastmcp import FastMCP
 from mcp.types import TextContent
@@ -12,7 +13,7 @@ from fastmcp.tools.tool import ToolResult
 
 # Try to import starlette for health check endpoint
 try:
-    from starlette.responses import JSONResponse
+    from starlette.responses import FileResponse, JSONResponse
     STARLETTE_AVAILABLE = True
 except ImportError:
     STARLETTE_AVAILABLE = False
@@ -32,8 +33,63 @@ from .functions import (
     list_clusters, list_performance, list_performance_graph, list_monitors, list_dynamic, list_view_instances, list_fields, describe_tool, query_users,
     list_dataflow
 )
-from .config import TEMPLATE_MODIFICATIONS_FILE, get_default_template_path, DATAFLOW_DEFAULT_TOP_N_DIAGRAM
+from .config import TEMPLATE_MODIFICATIONS_FILE, get_default_template_path, DATAFLOW_DEFAULT_TOP_N_DIAGRAM, GRAPH_TEMP_DIR
 from .template_parser import TemplateParser
+
+
+GRAPH_ROUTE_PREFIX = "/graphs"
+
+
+def _format_http_host(host: str) -> str:
+    """Return a client-usable host for generated URLs."""
+    if host in ("0.0.0.0", "::", ""):
+        return "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
+def _build_graph_http_url(filename: str, host: str, port: int, ssl_enabled: bool = False) -> str:
+    """Build the URL clients should use to fetch a generated graph."""
+    public_base_url = os.environ.get("VAST_ADMIN_MCP_PUBLIC_BASE_URL", "").rstrip("/")
+    graph_path = f"{GRAPH_ROUTE_PREFIX}/{quote(filename)}"
+    if public_base_url:
+        return f"{public_base_url}{graph_path}"
+
+    scheme = "https" if ssl_enabled else "http"
+    return f"{scheme}://{_format_http_host(host)}:{port}{graph_path}"
+
+
+def _add_http_graph_link(graph_data: Dict[str, Any], host: str, port: int, ssl_enabled: bool = False) -> Dict[str, Any]:
+    """Replace file:// graph URI with an HTTP URL for non-stdio clients."""
+    file_path = graph_data.get("file_path")
+    if not file_path:
+        return graph_data
+
+    filename = os.path.basename(file_path)
+    if not filename:
+        return graph_data
+
+    result = dict(graph_data)
+    original_uri = result.get("resource_uri")
+    if original_uri:
+        result["local_resource_uri"] = original_uri
+    result["resource_uri"] = _build_graph_http_url(filename, host, port, ssl_enabled=ssl_enabled)
+    result["display_note"] = "Please display the graph image using the resource_uri HTTP URL. The graph visualizes performance metrics over time."
+    return result
+
+
+def _resolve_graph_file_path(filename: str) -> Optional[str]:
+    """Resolve a generated graph filename without allowing directory traversal."""
+    safe_filename = os.path.basename(filename)
+    if filename != safe_filename:
+        return None
+
+    graph_dir = os.path.abspath(GRAPH_TEMP_DIR)
+    graph_path = os.path.abspath(os.path.join(graph_dir, safe_filename))
+    if not graph_path.startswith(graph_dir + os.sep) or not os.path.isfile(graph_path):
+        return None
+    return graph_path
 
 # Import create functions (only used when read_write=True)
 if True:  # Always import, but only register when read_write=True
@@ -153,6 +209,7 @@ def start_mcp(
     port: int = 8000,
     path: str = "/mcp/",
     auth_config: Optional[Dict[str, Any]] = None,
+    disable_graph_auth: bool = False,
     ssl_certfile: Optional[str] = None,
     ssl_keyfile: Optional[str] = None
 ):
@@ -165,6 +222,7 @@ def start_mcp(
         port: Port for HTTP transport (default: 8000)
         path: URL path for HTTP transport (default: /mcp/)
         auth_config: Authentication configuration dict
+        disable_graph_auth: If True, generated graph PNG links bypass bearer auth
         ssl_certfile: Path to SSL certificate file for HTTPS
         ssl_keyfile: Path to SSL private key file for HTTPS
     """
@@ -197,13 +255,16 @@ def start_mcp(
         class BearerTokenMiddleware(BaseHTTPMiddleware):
             """Middleware to validate Bearer token in Authorization header."""
             
-            def __init__(self, app, token: str):
+            def __init__(self, app, token: str, disable_graph_auth: bool = False):
                 super().__init__(app)
                 self.token = token
+                self.disable_graph_auth = disable_graph_auth
             
             async def dispatch(self, request, call_next):
-                # Skip auth for health check endpoint
+                # Skip auth for health check and, when configured, generated graph endpoints
                 if request.url.path == "/health":
+                    return await call_next(request)
+                if self.disable_graph_auth and request.url.path.startswith(f"{GRAPH_ROUTE_PREFIX}/"):
                     return await call_next(request)
                 
                 # Check Authorization header
@@ -220,7 +281,13 @@ def start_mcp(
                     media_type="application/json"
                 )
         
-        http_middleware = [Middleware(BearerTokenMiddleware, token=bearer_token)]
+        http_middleware = [
+            Middleware(
+                BearerTokenMiddleware,
+                token=bearer_token,
+                disable_graph_auth=disable_graph_auth
+            )
+        ]
     
     mcp = FastMCP("VAST Admin MCP Server", auth=auth)
     
@@ -234,6 +301,15 @@ def start_mcp(
                 "mode": mode_str,
                 "transport": transport
             })
+
+        @mcp.custom_route(f"{GRAPH_ROUTE_PREFIX}/{{filename}}", methods=["GET"])
+        async def graph_file(request):
+            filename = request.path_params["filename"]
+            graph_path = _resolve_graph_file_path(filename)
+            if not graph_path:
+                return JSONResponse({"error": "Graph not found"}, status_code=404)
+
+            return FileResponse(graph_path, media_type="image/png", filename=os.path.basename(graph_path))
 
     @mcp.tool(name="list_clusters_vast", description="Retrieve information about VAST clusters, their status, capacity and usage. IMPORTANT: Call this tool FIRST when you need to query 'all clusters' or discover available cluster names before using other tools like list_views_vast.")
     async def list_clusters_mcp(
@@ -673,6 +749,13 @@ def start_mcp(
                 object_name=object_name or None,
                 format=format or 'png'
             )
+            if transport != "stdio":
+                graph_data = _add_http_graph_link(
+                    graph_data,
+                    host=host,
+                    port=port,
+                    ssl_enabled=bool(ssl_certfile and ssl_keyfile)
+                )
             return _make_result(graph_data)
         except Exception as e:
             logging.error(f"Error generating performance graph: {e}")

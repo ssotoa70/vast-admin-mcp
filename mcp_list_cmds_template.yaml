@@ -47,6 +47,7 @@ api_whitelist:
   - protectionpolicies
   - protectedpaths
   - alarms
+  - events
   - nativereplicationremotetargets
   
   # Monitoring and metrics endpoints
@@ -831,6 +832,107 @@ list_cmds:
         {{$arguments}}
       Returns:
         A list of dnodes and dboxes. Each item in the list will be a dictionary containing general information regarding a specific dnode or dbox.
+      Fields:
+        {{$fields}}
+
+      {{prefer_tables}}
+
+  events:
+    # API endpoints to call (first endpoint is the primary data source)
+    api_endpoints: 
+    - events
+    max_rows: 500
+    time_filter:
+      field: timestamp
+      timeframe_arg: timeframe
+      start_arg: start_time
+      end_arg: end_time
+    # Selected fields for simplified view 
+    fields:
+      - <<: *cluster_field
+      - name: id
+      - name: timestamp
+        field: timestamp
+        convert: time_delta
+      - name: timeframe
+        field: false
+        hide: true
+        argument:
+          type: str
+          mandatory: false
+          description: >-
+            Relative event window, e.g. 5m, 1h, 24h, 1h30m. Translate natural-language requests
+            like "last hour" to "1h" and "last 50 minutes" to "50m" before calling this tool.
+            Mutually exclusive with start_time and end_time.
+      - name: start_time
+        field: false
+        hide: true
+        argument:
+          type: str
+          mandatory: false
+          description: >-
+            Absolute event window start time in ISO 8601 format, e.g. 2026-06-04T06:00:00Z.
+            Mutually exclusive with timeframe.
+      - name: end_time
+        field: false
+        hide: true
+        argument:
+          type: str
+          mandatory: false
+          description: >-
+            Absolute event window end time in ISO 8601 format, e.g. 2026-06-04T07:00:00Z.
+            Mutually exclusive with timeframe.
+      - name: object type
+        field: object_type
+        argument:
+          type: str
+          mandatory: false
+          filter: true
+          aliases:
+          - object_type
+          - object
+          - resource_type
+      - name: object name
+        field: object_name
+      - name: severity
+        argument:
+          type: str
+          mandatory: false
+          filter: true
+          aliases:
+          - severity
+          - level
+          regex_validation: ^(INFO|WARNING|MINOR|MAJOR|CRITICAL)$
+      - name: origin
+        field: event_origin
+        argument:
+          type: str
+          mandatory: false
+          filter: true
+          aliases:
+          - event_origin
+          - origin
+          - source
+      - name: event name
+        field: event_name
+        argument:
+          type: str
+          mandatory: false
+          filter: true
+          aliases:
+          - event_name
+          - name
+      - name: event type
+        field: event_type
+      - name: message
+        field: event_message
+
+    description: |-
+      Use this tool to retrieve a list of events from VAST cluster(s).
+      Args:
+        {{$arguments}}
+      Returns:
+        A list of events. Each item in the list will be a dictionary containing general information regarding a specific event.
       Fields:
         {{$fields}}
 
