@@ -159,6 +159,8 @@ The `list_cmds` section (required) contains all command definitions. Each comman
 **Optional Command-Level Properties**:
 
 - **`create_mcp_tool`** (boolean, default: `true`): If set to `false`, the command will not be registered as a standalone MCP tool. The command can still be used in merged commands and via CLI, but won't appear as a separate MCP tool. This is useful for commands that should only be available as part of merged commands.
+- **`max_rows`** (integer, optional): Maximum number of records returned per cluster after API/client-side filtering and field transformation. This limits the final rows returned to the user for each cluster, not the number of raw API rows fetched.
+- **`time_filter`** (dictionary, optional): Maps time-related arguments to API timestamp range filters. Supports a relative `timeframe` duration or absolute `start_time`/`end_time` values.
 
 **Example**:
 ```yaml
@@ -168,6 +170,17 @@ list_cmds:
     api_endpoints:
       - cnodes
       - cboxes
+    # ... rest of command definition
+
+  events:
+    api_endpoints:
+      - events
+    max_rows: 500
+    time_filter:
+      field: timestamp
+      timeframe_arg: timeframe
+      start_arg: start_time
+      end_arg: end_time
     # ... rest of command definition
 ```
 
@@ -217,7 +230,7 @@ Defines the output fields with their transformations and display options.
 
 # For fields that are also CLI/MCP arguments
 - name: <argument_name>         # Required: Argument name (also used as field name)
-  field: <api_field_name>       # Optional: API parameter name (defaults to name)
+  field: <api_field_name|false> # Optional: API parameter name (defaults to name). Use false for argument-only fields handled by custom command logic.
   argument:                     # Required: Argument configuration
     type: <str|int|bool|list|capacity>  # Optional: Argument type (default: str)
     mandatory: <bool>           # Optional: Required argument (default: false)
@@ -236,6 +249,7 @@ Defines the output fields with their transformations and display options.
 - **CLI parameter**: `field: $(cluster)` - Uses CLI argument value (e.g., cluster name)
 - **Joined field**: `field: quotas.hard_limit` - Uses joined data from secondary API endpoint
 - **Per-row endpoint field**: `field: capacity.root_data` - Uses data from per-row API endpoint
+- **Argument-only field**: `field: false` - Exposes a CLI/MCP argument but skips normal API mapping and output transformation. Use this with command-level logic such as `time_filter`.
 
 **Transformations**:
 
@@ -308,6 +322,57 @@ Defines the output fields with their transformations and display options.
         operator: equals  # or ==
         value: "cbox"
     ```
+
+### Command-Level Time Filtering
+
+The optional `time_filter` command property converts time arguments into API range filters on a timestamp field.
+
+**Behavior**:
+- `timeframe` uses `parse_time_duration()` syntax such as `5m`, `1h`, `24h`, or `1h30m`.
+- `timeframe` is converted to `<field>__gte = now - duration` and `<field>__lte = now`.
+- `start_time` maps to `<field>__gte`.
+- `end_time` maps to `<field>__lte`.
+- `timeframe` is mutually exclusive with `start_time` and `end_time`.
+- Natural-language phrases should be translated by the MCP agent before calling the tool, for example `last hour` -> `1h`, `last 50 minutes` -> `50m`.
+
+**Example**:
+```yaml
+list_cmds:
+  events:
+    api_endpoints:
+      - events
+    max_rows: 500
+    time_filter:
+      field: timestamp
+      timeframe_arg: timeframe
+      start_arg: start_time
+      end_arg: end_time
+    fields:
+      - name: timestamp
+        field: timestamp
+        convert: time_delta
+      - name: timeframe
+        field: false
+        hide: true
+        argument:
+          type: str
+          mandatory: false
+          description: >-
+            Relative event window, e.g. 5m, 1h, 24h, 1h30m.
+            Translate "last hour" to "1h" before calling this tool.
+      - name: start_time
+        field: false
+        hide: true
+        argument:
+          type: str
+          mandatory: false
+      - name: end_time
+        field: false
+        hide: true
+        argument:
+          type: str
+          mandatory: false
+```
 
 **Argument Fields**:
 
@@ -427,12 +492,15 @@ The YAML file is validated when loaded. Validation errors include:
 - **Field paths**: Errors show the full path to the problematic field (e.g., `list_cmds.views.fields[2].argument.type`)
 - **Error types**: `InvalidType`, `MissingRequired`, `InvalidValue`
 - **Context**: Shows expected vs actual values
+- **Command caps**: `max_rows` must be a positive integer when provided
+- **Time filters**: `time_filter` must be a dictionary with a string `field`; optional `timeframe_arg`, `start_arg`, and `end_arg` values must be strings
 
 **Example Error Messages**:
 ```
 list_cmds.views.fields[2].argument.type: InvalidValue - Expected one of ['str', 'int', 'bool', 'list', 'capacity'], got 'bool'
 list_cmds.volumes.api_endpoints: InvalidType - Expected list, got dict
 list_cmds.tenants.fields[0]: MissingRequired - Field must have 'header' or 'name' key
+list_cmds.events.max_rows: InvalidValue - Must be a positive integer
 ```
 
 ## Complete Example

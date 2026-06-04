@@ -3012,6 +3012,7 @@ def main():
         host = args.host if args.host is not None else http_config.get('host', '127.0.0.1')
         port = args.port if args.port is not None else http_config.get('port', 8000)
         path = args.path if args.path is not None else http_config.get('path', '/mcp/')
+        disable_graph_auth = bool(http_config.get('disable_output_auth', False))
         
         # SSL config: CLI args override config file
         ssl_cert = args.ssl_cert
@@ -3078,6 +3079,7 @@ def main():
             port=port,
             path=path,
             auth_config=auth_config,
+            disable_graph_auth=disable_graph_auth,
             ssl_certfile=ssl_cert,
             ssl_keyfile=ssl_key
         )

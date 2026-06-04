@@ -515,6 +515,27 @@ class TemplateParser:
                 if section not in template:
                     raise ValueError(f"{base_path}: MissingRequired - Missing required section '{section}'")
             
+            # Validate max_rows if present (optional command-level cap)
+            if 'max_rows' in template:
+                max_rows_path = f"{base_path}.max_rows"
+                if not isinstance(template['max_rows'], int):
+                    raise ValueError(f"{max_rows_path}: InvalidType - Expected integer, got {type(template['max_rows']).__name__}")
+                if template['max_rows'] <= 0:
+                    raise ValueError(f"{max_rows_path}: InvalidValue - Must be a positive integer")
+            
+            # Validate time_filter if present (optional command-level timestamp mapping)
+            if 'time_filter' in template:
+                time_filter_path = f"{base_path}.time_filter"
+                time_filter = template['time_filter']
+                if not isinstance(time_filter, dict):
+                    raise ValueError(f"{time_filter_path}: InvalidType - Expected dictionary, got {type(time_filter).__name__}")
+                if 'field' not in time_filter:
+                    raise ValueError(f"{time_filter_path}: MissingRequired - Missing required key 'field'")
+                for key in ['field', 'timeframe_arg', 'start_arg', 'end_arg']:
+                    if key in time_filter and not isinstance(time_filter[key], str):
+                        key_path = f"{time_filter_path}.{key}"
+                        raise ValueError(f"{key_path}: InvalidType - Expected string, got {type(time_filter[key]).__name__}")
+            
             # Validate api_endpoints
             api_endpoints_path = f"{base_path}.api_endpoints"
             if not isinstance(template['api_endpoints'], list):
@@ -745,6 +766,20 @@ class TemplateParser:
         if not template:
             return []
         return template.get('api_endpoints', [])
+    
+    def get_max_rows(self, command_name: str) -> Optional[int]:
+        """Get command-level API fetch cap, if configured."""
+        template = self.get_template(command_name)
+        if not template:
+            return None
+        return template.get('max_rows')
+    
+    def get_time_filter(self, command_name: str) -> Dict:
+        """Get command-level time filter configuration."""
+        template = self.get_template(command_name)
+        if not template:
+            return {}
+        return template.get('time_filter', {})
     
     def get_per_row_endpoints(self, command_name: str) -> List[Dict]:
         """Get list of per-row endpoint configurations for a command

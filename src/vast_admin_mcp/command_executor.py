@@ -13,7 +13,7 @@ import subprocess
 import shutil
 import fnmatch
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional, Tuple
 
 from .template_parser import TemplateParser
@@ -21,7 +21,7 @@ from .client import create_vast_client, call_vast_api
 from .config import load_config, JQ_TIMEOUT_SECONDS
 from .utils import (
     parse_filter_value, parse_capacity_value, parse_order_spec, apply_ordering, 
-    format_time_delta, normalize_field_name, to_python_name, to_raw_field_name
+    format_time_delta, normalize_field_name, parse_time_duration, to_python_name, to_raw_field_name
 )
 
 
@@ -115,6 +115,11 @@ class CommandExecutor:
         # 8. Ensure field order matches YAML definition (filter out hidden fields)
         final_data = self._ensure_field_order(command_name, transformed_data)
         
+        # 9. Apply command-level result cap after filtering for this cluster
+        max_rows = self.template_parser.get_max_rows(command_name)
+        if max_rows:
+            final_data = final_data[:max_rows]
+        
         return final_data
     
     def _validate_arguments(self, command_name: str, cli_args: Dict[str, Any]):
@@ -149,6 +154,7 @@ class CommandExecutor:
         api_endpoints = self.template_parser.get_api_endpoints(command_name)
         api_params = {endpoint: {} for endpoint in api_endpoints}
         client_filters = {}  # Store filters that need client-side processing
+        handled_time_args = self._apply_time_filter(command_name, cli_args, api_params)
         
         # Get all arguments configuration to check filter settings
         args_config = self.template_parser.get_arguments(command_name)
@@ -166,7 +172,7 @@ class CommandExecutor:
                 continue
             
             # Skip order, top, and internal flags as they're handled separately
-            if arg_name in ['order', 'top', '_output_format']:
+            if arg_name in ['order', 'top', '_output_format'] or arg_name in handled_time_args:
                 continue
                 
             api_param_name = self.template_parser.get_api_mapping(command_name, arg_name)
@@ -297,6 +303,64 @@ class CommandExecutor:
         # Store client filters for later use
         self._client_filters = client_filters
         return api_params
+    
+    def _apply_time_filter(self, command_name: str, cli_args: Dict[str, Any], api_params: Dict[str, Dict[str, Any]]) -> set:
+        """Apply command-level time_filter config to primary endpoint API params."""
+        time_filter = self.template_parser.get_time_filter(command_name)
+        if not time_filter:
+            return set()
+        
+        api_endpoints = self.template_parser.get_api_endpoints(command_name)
+        if not api_endpoints:
+            return set()
+        
+        field = time_filter.get('field')
+        timeframe_arg = time_filter.get('timeframe_arg', 'timeframe')
+        start_arg = time_filter.get('start_arg', 'start_time')
+        end_arg = time_filter.get('end_arg', 'end_time')
+        handled_args = {timeframe_arg, start_arg, end_arg}
+        
+        timeframe = cli_args.get(timeframe_arg)
+        start_time = cli_args.get(start_arg)
+        end_time = cli_args.get(end_arg)
+        
+        if timeframe and (start_time or end_time):
+            raise ValueError(f"'{timeframe_arg}' is mutually exclusive with '{start_arg}' and '{end_arg}'")
+        
+        target_params = api_params[api_endpoints[0]]
+        if timeframe:
+            duration_seconds = parse_time_duration(str(timeframe))
+            end_dt = datetime.now(timezone.utc)
+            start_dt = end_dt - timedelta(seconds=duration_seconds)
+            target_params[f"{field}__gte"] = self._format_api_timestamp(start_dt)
+            target_params[f"{field}__lte"] = self._format_api_timestamp(end_dt)
+        else:
+            if start_time:
+                target_params[f"{field}__gte"] = self._normalize_api_timestamp(str(start_time))
+            if end_time:
+                target_params[f"{field}__lte"] = self._normalize_api_timestamp(str(end_time))
+        
+        return handled_args
+    
+    def _normalize_api_timestamp(self, value: str) -> str:
+        """Validate and normalize an ISO 8601 timestamp for API filtering."""
+        try:
+            dt = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+        except ValueError:
+            raise ValueError(
+                f"Invalid timestamp '{value}'. Expected ISO 8601 format, "
+                "for example '2026-06-04T06:29:03Z'."
+            )
+        
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return self._format_api_timestamp(dt)
+    
+    def _format_api_timestamp(self, value: datetime) -> str:
+        """Format a UTC datetime as an ISO 8601 timestamp with Z suffix."""
+        return value.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
     
     def _execute_api_calls(self, command_name: str, api_params: Dict[str, Dict]) -> Dict[str, List[Dict]]:
         """Execute API calls for all endpoints using unified API call function"""
@@ -1011,6 +1075,9 @@ class CommandExecutor:
                 field_name = field_config['name']
                 source_field = field_config.get('field', field_name)
                 is_hidden = field_config.get('hide', False)
+                if source_field is False and 'value' not in field_config:
+                    # Argument-only fields can opt out of output transformation with field: false.
+                    continue
                 
                 # Check if field has a value expression (f-string)
                 # If present, evaluate it instead of reading from source field
