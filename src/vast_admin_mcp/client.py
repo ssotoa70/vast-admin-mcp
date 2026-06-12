@@ -146,7 +146,7 @@ def _patch_vast_client_request():
         
         # Rest of the request logic (copied from VASTClient.request)
         if self._token:
-            headers = {'authorization': f"'Api-Token {self._token}"}
+            headers = {'authorization': f'Api-Token {self._token}'}
         else:
             headers = urllib3.make_headers(basic_auth=self._user + ':' + self._password)
         if self._tenant:
@@ -231,6 +231,59 @@ _cluster_name_to_address_cache = {}
 _cluster_address_to_name_cache = {}
 
 _cache_manager = get_cache_manager()
+
+
+API_TOKEN_AUTH_METHODS = {'api_token', 'apitoken', 'token'}
+
+
+def _uses_api_token(cluster_info: Dict[str, Any]) -> bool:
+    """Return True when a cluster config is token-authenticated."""
+    auth_method = str(cluster_info.get('auth_method', '')).lower()
+    return auth_method in API_TOKEN_AUTH_METHODS or bool(cluster_info.get('api_token'))
+
+
+def _should_send_tenant(cluster_info: Dict[str, Any]) -> bool:
+    """Tenant header is not supported for legacy or super-admin connections."""
+    from .utils import is_vast_version_legacy
+
+    vast_version = cluster_info.get('vast_version', '')
+    return (
+        not is_vast_version_legacy(vast_version)
+        and cluster_info.get('user_type') != 'SUPER_ADMIN'
+        and bool(cluster_info.get('tenant'))
+    )
+
+
+def _create_client_from_cluster_info(cluster_address: str, cluster_info: Dict[str, Any], version: str = 'latest') -> VASTClient:
+    """Create a VASTClient from stored cluster config, supporting password or API token auth."""
+    use_api_token = _uses_api_token(cluster_info)
+    kwargs = {
+        'address': cluster_address,
+    }
+    if not use_api_token:
+        kwargs['version'] = version
+    if _should_send_tenant(cluster_info):
+        kwargs['tenant'] = cluster_info.get('tenant', '')
+
+    if use_api_token:
+        token_ref = cluster_info.get('api_token')
+        if not token_ref:
+            raise ValueError(f"API token reference is missing for cluster {cluster_address}")
+        try:
+            kwargs['token'] = retrieve_password_secure(cluster_address, 'api_token', token_ref)
+        except Exception as e:
+            raise ValueError(f"Failed to retrieve API token for cluster {cluster_address}: {e}")
+        return VASTClient(**kwargs)
+
+    username = cluster_info['username']
+    try:
+        password = retrieve_password_secure(cluster_address, username, cluster_info['password'])
+    except Exception as e:
+        raise ValueError(f"Failed to retrieve password for cluster {cluster_address}: {e}")
+
+    kwargs['user'] = username
+    kwargs['password'] = password
+    return VASTClient(**kwargs)
 
 
 def resolve_cluster_identifier(identifier: str, config: dict, client_cache: Optional[Dict[str, Any]] = None) -> tuple[str, dict, Optional[str]]:
@@ -319,12 +372,7 @@ def resolve_cluster_identifier(identifier: str, config: dict, client_cache: Opti
                                 client = client_cache[c['cluster']]
                             else:
                                 # Create temporary client to query cluster name
-                                username = c['username']
-                                password = retrieve_password_secure(c['cluster'], username, c['password'])
-                                if c.get('user_type') == 'SUPER_ADMIN':
-                                    client = VASTClient(address=c['cluster'], user=username, password=password, version='latest')
-                                else:
-                                    client = VASTClient(address=c['cluster'], user=username, password=password, tenant=c.get('tenant', ''), version='latest')
+                                client = _create_client_from_cluster_info(c['cluster'], c, version='latest')
                                 
                                 # Cache the client if cache dict provided
                                 if client_cache is not None:
@@ -435,25 +483,7 @@ def create_vast_client(cluster: str, use_cache: bool = True):
     
     # Use shared resolution function
     cluster_address, cluster_info, _ = resolve_cluster_identifier(cluster, cfg)
-    username = cluster_info['username']
-    
-    # Retrieve password securely
-    try:
-        password = retrieve_password_secure(cluster_address, username, cluster_info['password'])
-    except Exception as e:
-        raise ValueError(f"Failed to retrieve password for cluster {cluster_address}: {e}")
-    
-    # Check if this is a legacy version (< 5.3) - these don't support tenant parameter
-    from .utils import is_vast_version_legacy
-    vast_version = cluster_info.get('vast_version', '')
-    is_legacy = is_vast_version_legacy(vast_version)
-    
-    # For legacy versions or SUPER_ADMIN, connect without tenant
-    if is_legacy or cluster_info.get('user_type') == 'SUPER_ADMIN':
-        client = VASTClient(address=cluster_address, user=username, password=password, version='latest')
-    else:
-        # Modern version with tenant admin - use tenant parameter
-        client = VASTClient(address=cluster_address, user=username, password=password, tenant=cluster_info.get('tenant', ''), version='latest')
+    client = _create_client_from_cluster_info(cluster_address, cluster_info, version='latest')
 
     try:
         # Track which methods we've already wrapped to avoid double-wrapping
