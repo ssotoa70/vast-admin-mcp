@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.3] - 2026-06-12
+
+### Added
+
+- **Cluster API Token Authentication** -- now cluster authentication is support also using API tokens and not only username and password. API tokens are also kept securely using key ring like tokens. 
+
 ## [0.2.2] - 2026-06-04
 
 ### Added

@@ -16,6 +16,9 @@ from .utils import (
 from .client import create_vast_client
 
 
+API_TOKEN_USERNAME = "api_token"
+
+
 def parse_cluster_address(address: str) -> str:
     """Parse cluster address, supporting both URL format (https://host:port) and plain hostname:port format.
     
@@ -114,21 +117,59 @@ def parse_vast_version(build_string: str) -> tuple:
         return (0, 0)
 
 
-def validate_cluster(cluster: str, tenant: str, username: str, password: str, user_type: str = None) -> Dict[str, Any]:
+def _create_validation_client(
+    cluster_address: str,
+    tenant: str,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    api_token: Optional[str] = None,
+    user_type: str = None
+) -> VASTClient:
+    """Create a VASTClient for setup-time validation."""
+    kwargs = {'address': cluster_address}
+    if tenant and user_type != 'SUPER_ADMIN':
+        kwargs['tenant'] = tenant
+
+    if api_token:
+        kwargs['token'] = api_token
+    else:
+        kwargs['user'] = username
+        kwargs['password'] = password
+
+    return VASTClient(**kwargs)
+
+
+def validate_cluster(
+    cluster: str,
+    tenant: str,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    user_type: str = None,
+    api_token: Optional[str] = None,
+    auth_method: str = 'password'
+) -> Dict[str, Any]:
     """Validate cluster connectivity and return cluster info."""
     try:
         # Parse cluster address to handle URL format
         cluster_address = parse_cluster_address(cluster)
-        
-        # For SUPER_ADMIN users, don't pass tenant parameter (even if tenant is set in config)
-        # For tenant admins, always pass the tenant parameter
-        if user_type == 'SUPER_ADMIN':
-            client = VASTClient(address=cluster_address, user=username, password=password)
-        elif tenant != '':
-            client = VASTClient(address=cluster_address, user=username, password=password, tenant=tenant)
-        else:
-            client = VASTClient(address=cluster_address, user=username, password=password)
-        status = client.login.get()
+
+        if auth_method == 'api_token':
+            if not api_token:
+                raise ValueError("API token is required for API token authentication.")
+        elif not username or not password:
+            raise ValueError("Username and password are required for password authentication.")
+
+        client = _create_validation_client(
+            cluster_address=cluster_address,
+            tenant=tenant,
+            username=username,
+            password=password,
+            api_token=api_token,
+            user_type=user_type,
+        )
+        # API tokens authenticate regular API endpoints, but api/login may reject them
+        # before endpoint-level token auth is evaluated.
+        status = {} if auth_method == 'api_token' else client.login.get()
         
         # Get cluster info from clusters endpoint (same as list_clusters function)
         # This provides sw_version which is the proper version field
@@ -136,6 +177,7 @@ def validate_cluster(cluster: str, tenant: str, username: str, password: str, us
         sw_version = None
         build_number = None
         
+        clusters_error = None
         try:
             clusters_response = client.clusters.get(page_size=1)
             if clusters_response and 'results' in clusters_response and len(clusters_response['results']) > 0:
@@ -143,7 +185,13 @@ def validate_cluster(cluster: str, tenant: str, username: str, password: str, us
                 cluster_name = cluster_data.get('name')
                 sw_version = cluster_data.get('sw_version')
         except Exception as e:
+            clusters_error = e
             logging.debug(f"Could not get cluster info from clusters endpoint: {e}")
+
+        if auth_method == 'api_token' and not sw_version:
+            raise ValueError(
+                f"API token authentication failed: could not read clusters endpoint. {clusters_error}"
+            )
         
         # Fallback to dashboard.status if clusters endpoint failed
         if not sw_version:
@@ -157,7 +205,7 @@ def validate_cluster(cluster: str, tenant: str, username: str, password: str, us
             except Exception as e:
                 logging.debug(f"Could not get cluster info from dashboard.status: {e}")
                 sw_version = ''
-        
+
         # Format version like list_clusters does: take first 4 parts if dot-separated
         if isinstance(sw_version, str) and "." in sw_version and len(sw_version.split(".")) >= 4:
             vast_version = ".".join(sw_version.split(".")[:4])
@@ -181,22 +229,30 @@ def validate_cluster(cluster: str, tenant: str, username: str, password: str, us
             logging.info(f"Successfully connected to VAST cluster at {cluster_address}. "
                         f"Legacy version {vast_version} detected - treating as SUPER_ADMIN")
         else:
-            # For modern versions, use API user_type or default to TENANT_ADMIN
+            # For API tokens, api/login is skipped. Infer role from setup input:
+            # empty tenant means cluster admin; tenant set means tenant admin.
             if not user_type_from_api:
-                user_type_from_api = 'TENANT_ADMIN'
+                user_type_from_api = 'SUPER_ADMIN' if auth_method == 'api_token' and not tenant else 'TENANT_ADMIN'
             logging.info(f"Successfully connected to VAST cluster at {cluster_address}. "
                         f"Version: {vast_version}, User role: {user_type_from_api}")
 
-        # Store password securely (use parsed address for storage)
-        secure_password_ref = store_password_secure(cluster_address, username, password)
         result = {
             "cluster": cluster_address,  # Store parsed address (hostname:port format)
-            "username": username,
-            "password": secure_password_ref,  # Now stores secure reference instead of base64
             "tenant": tenant,
             "user_type": user_type_from_api,
             "vast_version": vast_version,  # Store version permanently in config
+            "auth_method": auth_method,
         }
+
+        if auth_method == 'api_token':
+            secure_token_ref = store_password_secure(cluster_address, API_TOKEN_USERNAME, api_token)
+            result["username"] = API_TOKEN_USERNAME
+            result["api_token"] = secure_token_ref
+        else:
+            # Store password securely (use parsed address for storage)
+            secure_password_ref = store_password_secure(cluster_address, username, password)
+            result["username"] = username
+            result["password"] = secure_password_ref  # Now stores secure reference instead of base64
         
         # Add cluster_name if we got it from the API
         if cluster_name:
@@ -374,29 +430,59 @@ def _add_new_cluster():
         
         tenant = input("For TENANT ADMINS only, enter tenant name [leave empty for super admin]: ").strip()
         
-        # Get credentials
-        if os.environ.get('VMS_USER'):
-            username = os.environ.get('VMS_USER')    
-            logging.info("Using VAST API username from environment variable VMS_USER")
-        else:
-            username = input("VAST API username: ").strip()
-            if not username:
-                logging.error("Username is required.")
-                return None
+        auth_method = 'password'
+        username = None
+        password = None
+        api_token = os.environ.get('VMS_API_TOKEN') or os.environ.get('VAST_API_TOKEN')
 
-        if os.environ.get('VMS_PASSWORD'):
-            password = os.environ.get('VMS_PASSWORD')
-            logging.info("Using VAST API password from environment variable VMS_PASSWORD")
+        if api_token:
+            auth_method = 'api_token'
+            logging.info("Using VAST API token from environment variable VMS_API_TOKEN/VAST_API_TOKEN")
         else:
-            from getpass import getpass
-            password = getpass("VAST password: ")
-            if not password:
-                logging.error("Password is required.")
-                return None
+            print("\nAuthentication method:")
+            print("  1. Username/password")
+            print("  2. API token")
+            auth_choice = input("Select [1]: ").strip() or "1"
+            auth_method = 'api_token' if auth_choice == '2' else 'password'
+
+        if auth_method == 'api_token':
+            if not api_token:
+                from getpass import getpass
+                api_token = getpass("VAST API token: ").strip()
+                if not api_token:
+                    logging.error("API token is required.")
+                    return None
+        else:
+            # Get credentials
+            if os.environ.get('VMS_USER'):
+                username = os.environ.get('VMS_USER')
+                logging.info("Using VAST API username from environment variable VMS_USER")
+            else:
+                username = input("VAST API username: ").strip()
+                if not username:
+                    logging.error("Username is required.")
+                    return None
+
+            if os.environ.get('VMS_PASSWORD'):
+                password = os.environ.get('VMS_PASSWORD')
+                logging.info("Using VAST API password from environment variable VMS_PASSWORD")
+            else:
+                from getpass import getpass
+                password = getpass("VAST password: ")
+                if not password:
+                    logging.error("Password is required.")
+                    return None
 
         # Validate cluster connectivity (use parsed address)
         logging.info(f"Testing connectivity to VAST cluster: {cluster_address}")
-        cluster_info = validate_cluster(cluster=cluster, tenant=tenant, username=username, password=password)
+        cluster_info = validate_cluster(
+            cluster=cluster,
+            tenant=tenant,
+            username=username,
+            password=password,
+            api_token=api_token,
+            auth_method=auth_method,
+        )
         
         if not cluster_info:
             logging.error(f"Could not connect to cluster: {cluster} with the provided credentials.")
@@ -427,12 +513,16 @@ def _edit_cluster(cluster_info):
     try:
         print(f"Current cluster: {cluster_info['cluster']}")
         print(f"Current tenant: {cluster_info.get('tenant', 'N/A')}")
-        print(f"Current user: {cluster_info['username']}")
+        auth_method = cluster_info.get('auth_method', 'password')
+        current_user = cluster_info.get('username', API_TOKEN_USERNAME if auth_method == 'api_token' else 'N/A')
+        print(f"Current auth: {'API token' if auth_method == 'api_token' else 'Username/password'}")
+        if auth_method != 'api_token':
+            print(f"Current user: {current_user}")
         version_info = f" (v{cluster_info['vast_version']})" if cluster_info.get('vast_version') else ""
         print(f"User type: {cluster_info.get('user_type', 'N/A')}{version_info}")
         
         print("\nWhat would you like to update?")
-        print("  1. Username/Password")
+        print("  1. Authentication credentials")
         print("  2. Tenant (super admin only)")
         print("  3. Test connectivity (no changes)")
         print("  0. Cancel")
@@ -443,15 +533,46 @@ def _edit_cluster(cluster_info):
             return None
         elif choice == '1':
             # Update credentials
-            new_username = input(f"Username [{cluster_info['username']}]: ").strip()
-            if not new_username:
-                new_username = cluster_info['username']
-            
+            print("\nAuthentication method:")
+            print("  1. Username/password")
+            print("  2. API token")
+            default_choice = "2" if auth_method == 'api_token' else "1"
+            auth_choice = input(f"Select [{default_choice}]: ").strip() or default_choice
+            new_auth_method = 'api_token' if auth_choice == '2' else 'password'
+
+            new_username = None
+            new_password = None
+            new_api_token = None
+
             from getpass import getpass
-            new_password = getpass("New password (leave empty to keep current): ")
-            if not new_password:
-                # Keep current password - retrieve it securely
-                new_password = retrieve_password_secure(cluster_info['cluster'], cluster_info['username'], cluster_info['password'])
+            if new_auth_method == 'api_token':
+                new_api_token = getpass("New API token (leave empty to keep current): ").strip()
+                if not new_api_token:
+                    if cluster_info.get('api_token'):
+                        new_api_token = retrieve_password_secure(cluster_info['cluster'], API_TOKEN_USERNAME, cluster_info['api_token'])
+                    else:
+                        logging.error("API token is required.")
+                        return None
+            else:
+                new_username = input(f"Username [{cluster_info.get('username', '')}]: ").strip()
+                if not new_username:
+                    new_username = cluster_info.get('username', '')
+                if not new_username:
+                    logging.error("Username is required.")
+                    return None
+
+                new_password = getpass("New password (leave empty to keep current): ")
+                if not new_password:
+                    if cluster_info.get('password'):
+                        # Keep current password - retrieve it securely
+                        new_password = retrieve_password_secure(
+                            cluster_info['cluster'],
+                            cluster_info.get('username', new_username),
+                            cluster_info['password'],
+                        )
+                    else:
+                        logging.error("Password is required.")
+                        return None
             
             # Test new credentials
             logging.info("Testing new credentials...")
@@ -460,7 +581,9 @@ def _edit_cluster(cluster_info):
                 tenant=cluster_info.get('tenant', ''), 
                 username=new_username, 
                 password=new_password,
-                user_type=cluster_info.get('user_type')
+                user_type=cluster_info.get('user_type'),
+                api_token=new_api_token,
+                auth_method=new_auth_method,
             )
             
             if not updated_info:
@@ -534,20 +657,34 @@ def _test_cluster_connectivity(cluster_info):
     """Test connectivity to a cluster"""
     try:
         print(f"\nTesting connectivity to {cluster_info['cluster']}...")
-        password = retrieve_password_secure(cluster_info['cluster'], cluster_info['username'], cluster_info['password'])
+        auth_method = cluster_info.get('auth_method', 'password')
+        username = cluster_info.get('username')
+        password = None
+        api_token = None
+
+        if auth_method == 'api_token' or cluster_info.get('api_token'):
+            api_token = retrieve_password_secure(cluster_info['cluster'], API_TOKEN_USERNAME, cluster_info['api_token'])
+            auth_method = 'api_token'
+        else:
+            password = retrieve_password_secure(cluster_info['cluster'], username, cluster_info['password'])
         
         result = validate_cluster(
             cluster=cluster_info['cluster'],
             tenant=cluster_info.get('tenant', ''),
-            username=cluster_info['username'],
+            username=username,
             password=password,
-            user_type=cluster_info.get('user_type')
+            user_type=cluster_info.get('user_type'),
+            api_token=api_token,
+            auth_method=auth_method,
         )
         
         if result:
             print(f"✅ Successfully connected to {cluster_info['cluster']}")
             version_info = f" (v{result['vast_version']})" if result.get('vast_version') else ""
-            print(f"   User: {result['username']} ({result.get('user_type', 'N/A')}{version_info})")
+            if result.get('auth_method') == 'api_token':
+                print(f"   Auth: API token ({result.get('user_type', 'N/A')}{version_info})")
+            else:
+                print(f"   User: {result['username']} ({result.get('user_type', 'N/A')}{version_info})")
             if '_build' in result:
                 print(f"   Build: {result['_build']}")
         else:
